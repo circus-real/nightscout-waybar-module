@@ -145,12 +145,12 @@ enum Severity {
 	Critical,
 }
 
-impl Into<&str> for Severity {
-	fn into(self) -> &'static str {
-		match self {
-			Self::Critical => "crit",
-			Self::Warning => "warn",
-			Self::Info => "info",
+impl From<Severity> for &str {
+	fn from(val: Severity) -> Self {
+		match val {
+			Severity::Critical => "crit",
+			Severity::Warning => "warn",
+			Severity::Info => "info",
 		}
 	}
 }
@@ -191,9 +191,9 @@ enum NotificationUrgency {
 	Critical,
 }
 
-impl Into<&str> for NotificationUrgency {
-	fn into(self) -> &'static str {
-		match self {
+impl From<NotificationUrgency> for &str {
+	fn from(val: NotificationUrgency) -> Self {
+		match val {
 			NotificationUrgency::Low => "low",
 			NotificationUrgency::Normal => "normal",
 			NotificationUrgency::Critical => "critical",
@@ -319,7 +319,7 @@ fn run_bg_module(url: &str, cfg: &BgConfig, cached: BgCache) -> (BgCache, Module
 			out.status_line = "NS: API ERR".to_string();
 			out.tooltip_lines.push(msg.clone());
 			out.severity = Severity::Info;
-			out.error = Some(err.clone());
+			out.error = Some(err);
 			out.notifications.push(Notification {
 				message: msg,
 				urgency: NotificationUrgency::Critical,
@@ -334,7 +334,7 @@ fn run_bg_module(url: &str, cfg: &BgConfig, cached: BgCache) -> (BgCache, Module
 		out.status_line = "NS: NO DATA".to_string();
 		out.tooltip_lines.push(msg.clone());
 		out.severity = Severity::Info;
-		out.error = Some(err.clone());
+		out.error = Some(err);
 		out.notifications.push(Notification {
 			message: msg,
 			urgency: NotificationUrgency::Critical,
@@ -354,7 +354,7 @@ fn run_bg_module(url: &str, cfg: &BgConfig, cached: BgCache) -> (BgCache, Module
 		out.status_line = "NS: STALE".to_string();
 		out.tooltip_lines.push(msg.clone());
 		out.severity = Severity::Info;
-		out.error = Some(err.clone());
+		out.error = Some(err);
 		out.notifications.push(Notification {
 			message: msg,
 			urgency: NotificationUrgency::Critical,
@@ -686,10 +686,7 @@ fn main() {
 	// --- Combine outputs ---
 	let outputs = [bg_result.1, pump_result.1, tx_result.1];
 
-	let status_line = outputs
-		.clone()
-		.map(|r| r.status_line)
-		.join(&" ".to_string());
+	let status_line = outputs.clone().map(|r| r.status_line).join(" ");
 
 	let tooltip_lines = outputs.clone().map(|r| r.tooltip_lines).concat();
 
