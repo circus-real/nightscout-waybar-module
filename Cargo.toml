@@ -1,7 +1,12 @@
 [package]
 name = "nightscout-waybar-module"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+authors = ["circusreal"]
+description = "Output NightScout data in JSON for a Waybar custom module"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+homepage = "https://github.com/circus-real/nightscout-waybar-module"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
