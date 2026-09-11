@@ -582,9 +582,11 @@ fn main() {
 		pump: Err(ModuleError::CacheParse),
 	});
 
+	let clean_url = cli.url.trim().trim_end_matches('/').trim();
+
 	// --- Run modules ---
-	let bg_result = run_bg_module(&cli.url, &cfg.bg, cache.bg);
-	let pump_result = run_pump_module(&cli.url, &cfg.pump, cache.pump);
+	let bg_result = run_bg_module(clean_url, &cfg.bg, cache.bg);
+	let pump_result = run_pump_module(clean_url, &cfg.pump, cache.pump);
 
 	// --- Combine outputs ---
 	let outputs = [bg_result.1, pump_result.1];
