@@ -75,10 +75,10 @@ impl Default for Config {
 impl Default for BgConfig {
 	fn default() -> Self {
 		Self {
-			low_warn: 4.0,
-			high_warn: 10.0,
-			low_crit: 3.3,
-			high_crit: 14.0,
+			low_warn: 75.0,
+			high_warn: 180.0,
+			low_crit: 60.0,
+			high_crit: 250.0,
 			stale_mins: 15,
 			use_mmol_units: false,
 		}
@@ -280,17 +280,21 @@ fn arrow_for(direction: &str) -> &'static str {
 }
 
 fn classify_bg(cfg: &BgConfig, bg: f64) -> Severity {
-	if bg < cfg.low_crit {
+	if bg < convert_units(cfg.low_crit, cfg.use_mmol_units) {
 		Severity::Critical
-	} else if bg < cfg.low_warn {
+	} else if bg < convert_units(cfg.low_warn, cfg.use_mmol_units) {
 		Severity::Warning
-	} else if bg > cfg.high_crit {
+	} else if bg > convert_units(cfg.high_crit, cfg.use_mmol_units) {
 		Severity::Critical
-	} else if bg > cfg.high_warn {
+	} else if bg > convert_units(cfg.high_warn, cfg.use_mmol_units) {
 		Severity::Warning
 	} else {
 		Severity::Info
 	}
+}
+
+fn convert_units(bg_mgdl: f64, use_mmol: bool) -> f64 {
+	if use_mmol { bg_mgdl / 18.0 } else { bg_mgdl }
 }
 
 fn run_bg_module(url: &str, cfg: &BgConfig, cached: BgCache) -> (BgCache, ModuleOutput) {
@@ -349,27 +353,25 @@ fn run_bg_module(url: &str, cfg: &BgConfig, cached: BgCache) -> (BgCache, Module
 		return (BgCache::Err(err), out);
 	}
 
-	// Convert mg/dL -> mmol/L if needed
-	let bg = if cfg.use_mmol_units {
-		entry.sgv / 18.0
-	} else {
-		entry.sgv
-	};
+	let bg = convert_units(entry.sgv, cfg.use_mmol_units);
 	let direction = entry.direction.as_deref().unwrap_or("NONE");
 	let arrow = arrow_for(direction);
 
 	let severity = classify_bg(cfg, bg);
-	let description = if bg > cfg.high_warn {
+	let description = if bg > convert_units(cfg.high_warn, cfg.use_mmol_units) {
 		"high"
-	} else if bg < cfg.low_warn {
+	} else if bg < convert_units(cfg.low_warn, cfg.use_mmol_units) {
 		"low"
 	} else {
 		"ok"
 	};
 
 	out.status_line = format!("{bg:.1} {arrow}");
-	out.tooltip_lines
-		.push(format!("Current: {bg:.1} mmol/L {arrow}"));
+	out.tooltip_lines.push(if cfg.use_mmol_units {
+		format!("Current: {bg:.1} mmol/L {arrow}")
+	} else {
+		format!("Current: {bg:.0} mmol/L {arrow}")
+	});
 	out.tooltip_lines.push(format!(
 		"Status: {description} ({})",
 		<Severity as Into<&str>>::into(severity)
@@ -381,10 +383,17 @@ fn run_bg_module(url: &str, cfg: &BgConfig, cached: BgCache) -> (BgCache, Module
 		BgCache::Err(_) => true,
 	} {
 		out.notifications.push(Notification {
-			message: format!(
-				"BG ALERT: {bg:.1} mmol/L ({})",
-				<Severity as Into<&str>>::into(severity)
-			),
+			message: if cfg.use_mmol_units {
+				format!(
+					"BG ALERT: {bg:.1} mmol/L ({})",
+					<Severity as Into<&str>>::into(severity)
+				)
+			} else {
+				format!(
+					"BG ALERT: {bg:.0} mmol/L ({})",
+					<Severity as Into<&str>>::into(severity)
+				)
+			},
 			urgency: out.severity.into(),
 		});
 	}

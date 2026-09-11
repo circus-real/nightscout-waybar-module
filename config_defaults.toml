@@ -1,10 +1,10 @@
 cache_file_path = "/tmp/waybar_nightscout_state.json"
 
 [bg]
-low_warn = 4.0
-high_warn = 10.0
-low_crit = 3.3
-high_crit = 14.0
+low_warn = 75.0
+high_warn = 180.0
+low_crit = 60.0
+high_crit = 250.0
 stale_mins = 15
 use_mmol_units = false
 
