@@ -22,6 +22,10 @@ struct Cli {
 	/// Path to config file (TOML)
 	#[arg(short = 'c', long = "config")]
 	config: Option<PathBuf>,
+
+	/// Use mmol/L units (instead of mg/dL default)
+	#[arg(long = "mmol")]
+	use_mmol_units: bool,
 }
 
 // ============================================================================
@@ -561,7 +565,8 @@ fn send_notification(n: &Notification) {
 
 fn main() {
 	let cli = Cli::parse();
-	let cfg = Config::load(cli.config.as_ref());
+	let mut cfg = Config::load(cli.config.as_ref());
+	cfg.bg.use_mmol_units |= cli.use_mmol_units;
 
 	let cache: Cache = serde_json::from_value(load_cache(&cfg.cache_file_path)).unwrap_or(Cache {
 		bg: Err(ModuleError::CacheParse),
