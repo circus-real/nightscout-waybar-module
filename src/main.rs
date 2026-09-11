@@ -34,7 +34,6 @@ struct Config {
 	cache_file_path: String,
 	bg: BgConfig,
 	pump: PumpConfig,
-	transmitter: TransmitterConfig,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -59,20 +58,12 @@ struct PumpConfig {
 	lifetime_hours: i64,
 }
 
-#[derive(Deserialize, Debug, Clone)]
-#[serde(default)]
-struct TransmitterConfig {
-	expiry_warn_hours: i64,
-	expiry_crit_hours: i64,
-}
-
 impl Default for Config {
 	fn default() -> Self {
 		Self {
 			cache_file_path: "/tmp/waybar_nightscout_state.json".to_string(),
 			bg: BgConfig::default(),
 			pump: PumpConfig::default(),
-			transmitter: TransmitterConfig::default(),
 		}
 	}
 }
@@ -94,20 +85,11 @@ impl Default for PumpConfig {
 	fn default() -> Self {
 		Self {
 			res_show: 50.0,
-			res_warn: 50.0,
+			res_warn: 40.0,
 			res_crit: 30.0,
 			expiry_warn_hours: 24,
 			expiry_crit_hours: 2,
 			lifetime_hours: 72,
-		}
-	}
-}
-
-impl Default for TransmitterConfig {
-	fn default() -> Self {
-		Self {
-			expiry_warn_hours: 24,
-			expiry_crit_hours: 3,
 		}
 	}
 }
@@ -271,7 +253,7 @@ fn format_hours(hours: f64) -> (String, String) {
 #[derive(Deserialize)]
 struct Entry {
 	sgv: f64,
-	date: i64,
+	date: f64,
 	#[serde(default)]
 	direction: Option<String>,
 }
@@ -309,7 +291,7 @@ fn classify_bg(cfg: &BgConfig, bg: f64) -> Severity {
 
 fn run_bg_module(url: &str, cfg: &BgConfig, cached: BgCache) -> (BgCache, ModuleOutput) {
 	let mut out = ModuleOutput::empty();
-	let endpoint = format!("{url}/api/v1/entries/current.json");
+	let endpoint = format!("{url}/api/v1/entries.json?count=1");
 
 	let entries: Vec<Entry> = match http_get_json(&endpoint) {
 		Ok(v) => v,
@@ -343,7 +325,7 @@ fn run_bg_module(url: &str, cfg: &BgConfig, cached: BgCache) -> (BgCache, Module
 	};
 
 	// Stale check
-	let entry_time = DateTime::from_timestamp(entry.date / 1000, 0);
+	let entry_time = DateTime::from_timestamp(entry.date.round() as i64 / 1000, 0);
 	let is_stale = match entry_time {
 		Some(t) => Utc::now().signed_duration_since(t) > Duration::seconds(cfg.stale_mins * 60),
 		None => true,
@@ -466,7 +448,7 @@ fn run_pump_module(url: &str, cfg: &PumpConfig, cached: PumpCache) -> (PumpCache
 	}
 
 	// --- Pod expiry ---
-	let tx_endpoint = format!("{url}/api/v1/treatments.json?eventType=Pod%20Change&count=1");
+	let tx_endpoint = format!("{url}/api/v1/treatments.json?find[eventType]=Pod+Change&count=1");
 	let pod_change = http_get_json::<Vec<Treatment>>(&tx_endpoint)
 		.ok()
 		.and_then(|v| v.into_iter().next())
@@ -478,6 +460,10 @@ fn run_pump_module(url: &str, cfg: &PumpConfig, cached: PumpCache) -> (PumpCache
 	if let Some(change_dt) = pod_change {
 		let expiry = change_dt + Duration::seconds(cfg.lifetime_hours * 3600);
 		let hours_remaining = (expiry - Utc::now()).num_seconds() as f64 / 3600.0;
+		println!(
+			"remain {} exp {} changed {}",
+			hours_remaining, expiry, change_dt
+		);
 
 		exp_state = if hours_remaining < cfg.expiry_crit_hours as f64 {
 			Severity::Critical
@@ -537,104 +523,6 @@ fn run_pump_module(url: &str, cfg: &PumpConfig, cached: PumpCache) -> (PumpCache
 }
 
 // ============================================================================
-// Transmitter module
-// ============================================================================
-
-#[derive(Deserialize)]
-struct Transmitter {
-	#[serde(rename = "transmitterStartDate")]
-	start_date: Option<String>,
-	#[serde(rename = "transmitterEndDate")]
-	end_date: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct DeviceStatusWithTx {
-	#[serde(default)]
-	transmitter: Option<Transmitter>,
-}
-
-type TxCache = Result<Severity, ModuleError>;
-
-fn format_age(start: DateTime<Utc>) -> String {
-	let delta = Utc::now() - start;
-	let days = delta.num_days();
-	let hours = delta.num_hours() % 24;
-	format!("{days}d{hours}h")
-}
-
-fn run_transmitter_module(
-	url: &str,
-	cfg: &TransmitterConfig,
-	cached: TxCache,
-) -> (TxCache, ModuleOutput) {
-	let mut out = ModuleOutput::empty();
-	let endpoint = format!("{url}/api/v1/devicestatus.json?count=1");
-
-	let tx = match http_get_json::<Vec<DeviceStatusWithTx>>(&endpoint) {
-		Ok(v) => v.into_iter().next().and_then(|d| d.transmitter),
-		Err(_) => None,
-	};
-
-	let Some(tx) = tx else {
-		return (TxCache::Err(ModuleError::Http), out);
-	};
-
-	let start = tx.start_date.as_deref().and_then(parse_time);
-	let end = tx.end_date.as_deref().and_then(parse_time);
-
-	let age_str = start
-		.map(format_age)
-		.unwrap_or_else(|| "Unknown".to_string());
-
-	let (state, display, tooltip_remaining) = match end {
-		Some(end_dt) => {
-			let hours_remaining = (end_dt - Utc::now()).num_seconds() as f64 / 3600.0;
-			let state = if hours_remaining < cfg.expiry_crit_hours as f64 {
-				Severity::Critical
-			} else if hours_remaining < cfg.expiry_warn_hours as f64 {
-				Severity::Warning
-			} else {
-				Severity::Info
-			};
-			let (display, tooltip) = format_hours(hours_remaining);
-			(state, display, Some(tooltip))
-		},
-		None => (Severity::Info, "?".to_string(), None),
-	};
-
-	let mut tooltip = format!("Transmitter age: {age_str}");
-	if let Some(rem) = &tooltip_remaining {
-		tooltip.push_str(&format!(", Expires in: {rem}"));
-	}
-	out.tooltip_lines.push(tooltip);
-	out.tooltip_lines.push(format!(
-		"Tx status: {}",
-		<Severity as Into<&str>>::into(state)
-	));
-	if state != Severity::Info {
-		out.status_line = format!("Tx:{display}");
-		out.severity = state;
-	}
-
-	if match cached {
-		TxCache::Ok(sev) => sev != state,
-		TxCache::Err(_) => false,
-	} {
-		let rem = tooltip_remaining.unwrap_or_else(|| display.clone());
-		out.notifications.push(Notification {
-			message: format!(
-				"TRANSMITTER ALERT: Expires in {rem} ({})",
-				<Severity as Into<&str>>::into(state)
-			),
-			urgency: state.into(),
-		});
-	}
-
-	(TxCache::Ok(state), out)
-}
-
-// ============================================================================
 // Cache
 // ============================================================================
 
@@ -642,7 +530,6 @@ fn run_transmitter_module(
 struct Cache {
 	bg: BgCache,
 	pump: PumpCache,
-	tx: TxCache,
 }
 
 fn load_cache(path: &str) -> serde_json::Value {
@@ -676,17 +563,24 @@ fn main() {
 	let cli = Cli::parse();
 	let cfg = Config::load(cli.config.as_ref());
 
-	let cache: Cache = serde_json::from_value(load_cache(&cfg.cache_file_path)).unwrap();
+	let cache: Cache = serde_json::from_value(load_cache(&cfg.cache_file_path)).unwrap_or(Cache {
+		bg: Err(ModuleError::CacheParse),
+		pump: Err(ModuleError::CacheParse),
+	});
 
 	// --- Run modules ---
 	let bg_result = run_bg_module(&cli.url, &cfg.bg, cache.bg);
 	let pump_result = run_pump_module(&cli.url, &cfg.pump, cache.pump);
-	let tx_result = run_transmitter_module(&cli.url, &cfg.transmitter, cache.tx);
 
 	// --- Combine outputs ---
-	let outputs = [bg_result.1, pump_result.1, tx_result.1];
+	let outputs = [bg_result.1, pump_result.1];
 
-	let status_line = outputs.clone().map(|r| r.status_line).join(" ");
+	let status_line = outputs
+		.clone()
+		.map(|r| r.status_line)
+		.iter()
+		.filter(|l| l != &"")
+		.fold("".to_string(), |a, b| format!("{} {}", a.trim(), b.trim()));
 
 	let tooltip_lines = outputs.clone().map(|r| r.tooltip_lines).concat();
 
@@ -697,7 +591,9 @@ fn main() {
 		.reduce(max)
 		.unwrap_or(Severity::Info);
 
-	let notifications = outputs.map(|r| r.notifications).concat();
+	let notifications = outputs.clone().map(|r| r.notifications).concat();
+
+	let had_errors = outputs.map(|r| r.error.is_some()).iter().any(|x| *x);
 
 	// --- Send notifications ---
 	for n in &notifications {
@@ -710,7 +606,6 @@ fn main() {
 		&serde_json::to_value(Cache {
 			bg: bg_result.0,
 			pump: pump_result.0,
-			tx: tx_result.0,
 		})
 		.unwrap(),
 	);
@@ -719,7 +614,11 @@ fn main() {
 	let output = WaybarOutput {
 		text: status_line,
 		tooltip: tooltip_lines.join("\n"),
-		class: <Severity as Into<&str>>::into(overall_severity).to_string(),
+		class: if had_errors {
+			"error".to_string()
+		} else {
+			<Severity as Into<&str>>::into(overall_severity).to_string()
+		},
 	};
 
 	println!("{}", serde_json::to_string(&output).unwrap());
