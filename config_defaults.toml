@@ -1,0 +1,21 @@
+cache_file_path = "/tmp/waybar_nightscout_state.json"
+
+[bg]
+low_warn = 4.0
+high_warn = 10.0
+low_crit = 3.3
+high_crit = 14.0
+stale_mins = 15
+use_mmol_units = false
+
+[pump]
+res_show = 50.0
+res_warn = 50.0
+res_crit = 30.0
+expiry_warn_hours = 24
+expiry_crit_hours = 2
+lifetime_hours = 72
+
+[transmitter]
+expiry_warn_hours = 24
+expiry_crit_hours = 3
