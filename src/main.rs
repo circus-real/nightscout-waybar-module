@@ -1,6 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
+use std::cmp::max;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -44,6 +45,7 @@ struct BgConfig {
 	low_crit: f64,
 	high_crit: f64,
 	stale_mins: i64,
+	use_mmol_units: bool,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -83,6 +85,7 @@ impl Default for BgConfig {
 			low_crit: 3.3,
 			high_crit: 14.0,
 			stale_mins: 15,
+			use_mmol_units: false,
 		}
 	}
 }
@@ -135,13 +138,38 @@ impl Config {
 // Shared types
 // ============================================================================
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+enum Severity {
+	Info,
+	Warning,
+	Critical,
+}
+
+impl Into<&str> for Severity {
+	fn into(self) -> &'static str {
+		match self {
+			Self::Critical => "crit",
+			Self::Warning => "warn",
+			Self::Info => "info",
+		}
+	}
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+enum ModuleError {
+	Http,
+	CacheParse,
+	StaleOrMissingData,
+}
+
+#[derive(Clone)]
 /// Output contributed by a single module.
 struct ModuleOutput {
 	status_line: String,
 	tooltip_lines: Vec<String>,
-	css_class: String,
+	severity: Severity,
 	notifications: Vec<Notification>,
-	cache_state: serde_json::Value,
+	error: Option<ModuleError>,
 }
 
 impl ModuleOutput {
@@ -149,16 +177,44 @@ impl ModuleOutput {
 		Self {
 			status_line: String::new(),
 			tooltip_lines: Vec::new(),
-			css_class: "normal".to_string(),
+			severity: Severity::Info,
 			notifications: Vec::new(),
-			cache_state: serde_json::json!({}),
+			error: None,
 		}
 	}
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum NotificationUrgency {
+	Low,
+	Normal,
+	Critical,
+}
+
+impl Into<&str> for NotificationUrgency {
+	fn into(self) -> &'static str {
+		match self {
+			NotificationUrgency::Low => "low",
+			NotificationUrgency::Normal => "normal",
+			NotificationUrgency::Critical => "critical",
+		}
+	}
+}
+
+impl From<Severity> for NotificationUrgency {
+	fn from(value: Severity) -> Self {
+		match value {
+			Severity::Critical => NotificationUrgency::Critical,
+			Severity::Warning => NotificationUrgency::Normal,
+			Severity::Info => NotificationUrgency::Low,
+		}
+	}
+}
+
+#[derive(Clone)]
 struct Notification {
 	message: String,
-	critical: bool,
+	urgency: NotificationUrgency,
 }
 
 #[derive(Serialize)]
@@ -168,33 +224,14 @@ struct WaybarOutput {
 	class: String,
 }
 
-const NORMAL: &str = "normal";
-const WARNING: &str = "warning";
-const CRITICAL: &str = "critical";
-const ERROR: &str = "error";
-
-fn state_rank(state: &str) -> i32 {
-	match state {
-		CRITICAL => 2,
-		WARNING => 1,
-		_ => 0,
-	}
-}
-
-/// True if `current` is a degradation compared to `previous`.
-fn is_degradation(previous: &str, current: &str) -> bool {
-	state_rank(current) > state_rank(previous)
-}
-
 // ============================================================================
 // HTTP helpers
 // ============================================================================
 
 fn http_get_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String> {
-	let agent = ureq::AgentBuilder::new()
+	ureq::AgentBuilder::new()
 		.timeout(std::time::Duration::from_secs(10))
-		.build();
-	agent
+		.build()
 		.get(url)
 		.call()
 		.map_err(|e| e.to_string())?
@@ -239,6 +276,8 @@ struct Entry {
 	direction: Option<String>,
 }
 
+type BgCache = Result<f64, ModuleError>;
+
 fn arrow_for(direction: &str) -> &'static str {
 	match direction {
 		"DoubleUp" => "↑↑",
@@ -254,27 +293,53 @@ fn arrow_for(direction: &str) -> &'static str {
 	}
 }
 
-fn run_bg_module(url: &str, cfg: &BgConfig, prev_state: &str) -> ModuleOutput {
+fn classify_bg(cfg: &BgConfig, bg: f64) -> Severity {
+	if bg < cfg.low_crit {
+		Severity::Critical
+	} else if bg < cfg.low_warn {
+		Severity::Warning
+	} else if bg > cfg.high_crit {
+		Severity::Critical
+	} else if bg > cfg.high_warn {
+		Severity::Warning
+	} else {
+		Severity::Info
+	}
+}
+
+fn run_bg_module(url: &str, cfg: &BgConfig, cached: BgCache) -> (BgCache, ModuleOutput) {
 	let mut out = ModuleOutput::empty();
 	let endpoint = format!("{url}/api/v1/entries/current.json");
 
 	let entries: Vec<Entry> = match http_get_json(&endpoint) {
 		Ok(v) => v,
 		Err(_) => {
+			let err = ModuleError::Http;
+			let msg = "Failed to fetch data from NightScout".to_string();
 			out.status_line = "NS: API ERR".to_string();
-			out.tooltip_lines
-				.push("Failed to fetch data from NightScout".to_string());
-			out.css_class = ERROR.to_string();
-			return out;
+			out.tooltip_lines.push(msg.clone());
+			out.severity = Severity::Info;
+			out.error = Some(err.clone());
+			out.notifications.push(Notification {
+				message: msg,
+				urgency: NotificationUrgency::Critical,
+			});
+			return (BgCache::Err(err), out);
 		},
 	};
 
 	let Some(entry) = entries.into_iter().next() else {
+		let err = ModuleError::StaleOrMissingData;
+		let msg = "No entries found in NightScout response".to_string();
 		out.status_line = "NS: NO DATA".to_string();
-		out.tooltip_lines
-			.push("No entries found in NightScout response".to_string());
-		out.css_class = WARNING.to_string();
-		return out;
+		out.tooltip_lines.push(msg.clone());
+		out.severity = Severity::Info;
+		out.error = Some(err.clone());
+		out.notifications.push(Notification {
+			message: msg,
+			urgency: NotificationUrgency::Critical,
+		});
+		return (BgCache::Err(err), out);
 	};
 
 	// Stale check
@@ -284,15 +349,22 @@ fn run_bg_module(url: &str, cfg: &BgConfig, prev_state: &str) -> ModuleOutput {
 		None => true,
 	};
 	if is_stale {
+		let err = ModuleError::StaleOrMissingData;
+		let msg = format!("CGM data is older than {} minutes", cfg.stale_mins);
 		out.status_line = "NS: STALE".to_string();
-		out.tooltip_lines
-			.push(format!("CGM data is older than {} minutes", cfg.stale_mins));
-		out.css_class = WARNING.to_string();
-		return out;
+		out.tooltip_lines.push(msg.clone());
+		out.severity = Severity::Info;
+		out.error = Some(err.clone());
+		out.notifications.push(Notification {
+			message: msg,
+			urgency: NotificationUrgency::Critical,
+		});
+
+		return (BgCache::Err(err), out);
 	}
 
 	// Convert mg/dL -> mmol/L if needed
-	let bg = if entry.sgv > 20.0 {
+	let bg = if cfg.use_mmol_units {
 		entry.sgv / 18.0
 	} else {
 		entry.sgv
@@ -300,34 +372,38 @@ fn run_bg_module(url: &str, cfg: &BgConfig, prev_state: &str) -> ModuleOutput {
 	let direction = entry.direction.as_deref().unwrap_or("NONE");
 	let arrow = arrow_for(direction);
 
-	let (state, description) = if bg < cfg.low_crit {
-		(CRITICAL, "low")
+	let severity = classify_bg(cfg, bg);
+	let description = if bg > cfg.high_warn {
+		"high"
 	} else if bg < cfg.low_warn {
-		(WARNING, "low")
-	} else if bg > cfg.high_crit {
-		(CRITICAL, "high")
-	} else if bg > cfg.high_warn {
-		(WARNING, "high")
+		"low"
 	} else {
-		(NORMAL, "normal")
+		"ok"
 	};
 
 	out.status_line = format!("{bg:.1} {arrow}");
 	out.tooltip_lines
 		.push(format!("Current: {bg:.1} mmol/L {arrow}"));
-	out.tooltip_lines
-		.push(format!("Status: {description} ({state})"));
-	out.css_class = state.to_string();
+	out.tooltip_lines.push(format!(
+		"Status: {description} ({})",
+		<Severity as Into<&str>>::into(severity)
+	));
+	out.severity = severity;
 
-	if is_degradation(prev_state, state) {
+	if match cached {
+		BgCache::Ok(cache_bg) => classify_bg(cfg, cache_bg) != severity,
+		BgCache::Err(_) => true,
+	} {
 		out.notifications.push(Notification {
-			message: format!("BG ALERT: {bg:.1} mmol/L ({state})"),
-			critical: state == CRITICAL,
+			message: format!(
+				"BG ALERT: {bg:.1} mmol/L ({})",
+				<Severity as Into<&str>>::into(severity)
+			),
+			urgency: out.severity.into(),
 		});
 	}
 
-	out.cache_state = serde_json::json!({ "state": state });
-	out
+	(BgCache::Ok(bg), out)
 }
 
 // ============================================================================
@@ -336,7 +412,6 @@ fn run_bg_module(url: &str, cfg: &BgConfig, prev_state: &str) -> ModuleOutput {
 
 #[derive(Deserialize)]
 struct DeviceStatus {
-	created_at: Option<String>,
 	#[serde(default)]
 	pump: Option<Pump>,
 }
@@ -351,10 +426,12 @@ struct Treatment {
 	created_at: Option<String>,
 }
 
-fn run_pump_module(url: &str, cfg: &PumpConfig, prev_cache: &serde_json::Value) -> ModuleOutput {
+type PumpCache = Result<(Severity, Severity), ModuleError>;
+
+fn run_pump_module(url: &str, cfg: &PumpConfig, cached: PumpCache) -> (PumpCache, ModuleOutput) {
 	let mut out = ModuleOutput::empty();
-	let mut res_state = NORMAL.to_string();
-	let mut exp_state = NORMAL.to_string();
+	let mut res_state = Severity::Info;
+	let mut exp_state = Severity::Info;
 
 	// --- Reservoir ---
 	let ds_endpoint = format!("{url}/api/v1/devicestatus.json?count=1");
@@ -366,21 +443,22 @@ fn run_pump_module(url: &str, cfg: &PumpConfig, prev_cache: &serde_json::Value) 
 
 	if let Some(res) = reservoir {
 		res_state = if res < cfg.res_crit {
-			CRITICAL
+			Severity::Critical
 		} else if res < cfg.res_warn {
-			WARNING
+			Severity::Warning
 		} else {
-			NORMAL
-		}
-		.to_string();
+			Severity::Info
+		};
 
-		out.tooltip_lines
-			.push(format!("\nReservoir: {res:.1}U ({res_state})"));
+		out.tooltip_lines.push(format!(
+			"\nReservoir: {res:.1}U ({})",
+			<Severity as Into<&str>>::into(res_state)
+		));
 
 		if res <= cfg.res_show {
-			let marker = match res_state.as_str() {
-				CRITICAL => "!",
-				WARNING => "*",
+			let marker = match res_state {
+				Severity::Critical => "!",
+				Severity::Warning => "*",
 				_ => "",
 			};
 			out.status_line = format!("{res:.0}U{marker}");
@@ -402,19 +480,20 @@ fn run_pump_module(url: &str, cfg: &PumpConfig, prev_cache: &serde_json::Value) 
 		let hours_remaining = (expiry - Utc::now()).num_seconds() as f64 / 3600.0;
 
 		exp_state = if hours_remaining < cfg.expiry_crit_hours as f64 {
-			CRITICAL
+			Severity::Critical
 		} else if hours_remaining < cfg.expiry_warn_hours as f64 {
-			WARNING
+			Severity::Warning
 		} else {
-			NORMAL
-		}
-		.to_string();
+			Severity::Info
+		};
 
 		let (display, tooltip) = format_hours(hours_remaining);
-		out.tooltip_lines
-			.push(format!("Pod expires: {tooltip} ({exp_state})"));
+		out.tooltip_lines.push(format!(
+			"Pod expires: {tooltip} ({})",
+			<Severity as Into<&str>>::into(exp_state)
+		));
 
-		if exp_state != NORMAL {
+		if exp_state != Severity::Info {
 			expiry_display = display.clone();
 			if !out.status_line.is_empty() {
 				out.status_line.push(' ');
@@ -424,45 +503,37 @@ fn run_pump_module(url: &str, cfg: &PumpConfig, prev_cache: &serde_json::Value) 
 	}
 
 	// --- Combine state ---
-	out.css_class = if res_state == CRITICAL || exp_state == CRITICAL {
-		CRITICAL.to_string()
-	} else if res_state == WARNING || exp_state == WARNING {
-		WARNING.to_string()
-	} else {
-		NORMAL.to_string()
-	};
+	out.severity = max(exp_state, res_state);
 
 	// --- Notifications ---
-	let prev_res = prev_cache
-		.get("res_state")
-		.and_then(|v| v.as_str())
-		.unwrap_or(NORMAL);
-	let prev_exp = prev_cache
-		.get("exp_state")
-		.and_then(|v| v.as_str())
-		.unwrap_or(NORMAL);
+	let (prev_res, prev_exp) = match cached {
+		PumpCache::Ok((r, x)) => (Some(r), Some(x)),
+		PumpCache::Err(_) => (None, None),
+	};
 
-	if is_degradation(prev_res, &res_state) {
-		if let Some(res) = reservoir {
-			out.notifications.push(Notification {
-				message: format!("RESERVOIR ALERT: {res:.1}U ({res_state})"),
-				critical: res_state == CRITICAL,
-			});
-		}
-	}
-
-	if is_degradation(prev_exp, &exp_state) && !expiry_display.is_empty() {
+	if Some(res_state) != prev_res
+		&& let Some(res) = reservoir
+	{
 		out.notifications.push(Notification {
-			message: format!("POD ALERT: Expires in {expiry_display} ({exp_state})"),
-			critical: exp_state == CRITICAL,
+			message: format!(
+				"RESERVOIR ALERT: {res:.1}U ({})",
+				<Severity as Into<&str>>::into(exp_state)
+			),
+			urgency: res_state.into(),
 		});
 	}
 
-	out.cache_state = serde_json::json!({
-		"res_state": res_state,
-		"exp_state": exp_state,
-	});
-	out
+	if Some(exp_state) != prev_exp && !expiry_display.is_empty() {
+		out.notifications.push(Notification {
+			message: format!(
+				"POD ALERT: Expires in {expiry_display} ({})",
+				<Severity as Into<&str>>::into(exp_state)
+			),
+			urgency: exp_state.into(),
+		});
+	}
+
+	(PumpCache::Ok((res_state, exp_state)), out)
 }
 
 // ============================================================================
@@ -483,6 +554,8 @@ struct DeviceStatusWithTx {
 	transmitter: Option<Transmitter>,
 }
 
+type TxCache = Result<Severity, ModuleError>;
+
 fn format_age(start: DateTime<Utc>) -> String {
 	let delta = Utc::now() - start;
 	let days = delta.num_days();
@@ -490,7 +563,11 @@ fn format_age(start: DateTime<Utc>) -> String {
 	format!("{days}d{hours}h")
 }
 
-fn run_transmitter_module(url: &str, cfg: &TransmitterConfig, prev_state: &str) -> ModuleOutput {
+fn run_transmitter_module(
+	url: &str,
+	cfg: &TransmitterConfig,
+	cached: TxCache,
+) -> (TxCache, ModuleOutput) {
 	let mut out = ModuleOutput::empty();
 	let endpoint = format!("{url}/api/v1/devicestatus.json?count=1");
 
@@ -500,7 +577,7 @@ fn run_transmitter_module(url: &str, cfg: &TransmitterConfig, prev_state: &str) 
 	};
 
 	let Some(tx) = tx else {
-		return out;
+		return (TxCache::Err(ModuleError::Http), out);
 	};
 
 	let start = tx.start_date.as_deref().and_then(parse_time);
@@ -514,16 +591,16 @@ fn run_transmitter_module(url: &str, cfg: &TransmitterConfig, prev_state: &str) 
 		Some(end_dt) => {
 			let hours_remaining = (end_dt - Utc::now()).num_seconds() as f64 / 3600.0;
 			let state = if hours_remaining < cfg.expiry_crit_hours as f64 {
-				CRITICAL
+				Severity::Critical
 			} else if hours_remaining < cfg.expiry_warn_hours as f64 {
-				WARNING
+				Severity::Warning
 			} else {
-				NORMAL
+				Severity::Info
 			};
 			let (display, tooltip) = format_hours(hours_remaining);
 			(state, display, Some(tooltip))
 		},
-		None => (NORMAL, "?".to_string(), None),
+		None => (Severity::Info, "?".to_string(), None),
 	};
 
 	let mut tooltip = format!("Transmitter age: {age_str}");
@@ -531,28 +608,42 @@ fn run_transmitter_module(url: &str, cfg: &TransmitterConfig, prev_state: &str) 
 		tooltip.push_str(&format!(", Expires in: {rem}"));
 	}
 	out.tooltip_lines.push(tooltip);
-	out.tooltip_lines.push(format!("Tx status: {state}"));
-
-	if state != NORMAL {
+	out.tooltip_lines.push(format!(
+		"Tx status: {}",
+		<Severity as Into<&str>>::into(state)
+	));
+	if state != Severity::Info {
 		out.status_line = format!("Tx:{display}");
-		out.css_class = state.to_string();
+		out.severity = state;
 	}
 
-	if is_degradation(prev_state, state) {
+	if match cached {
+		TxCache::Ok(sev) => sev != state,
+		TxCache::Err(_) => false,
+	} {
 		let rem = tooltip_remaining.unwrap_or_else(|| display.clone());
 		out.notifications.push(Notification {
-			message: format!("TRANSMITTER ALERT: Expires in {rem} ({state})"),
-			critical: state == CRITICAL,
+			message: format!(
+				"TRANSMITTER ALERT: Expires in {rem} ({})",
+				<Severity as Into<&str>>::into(state)
+			),
+			urgency: state.into(),
 		});
 	}
 
-	out.cache_state = serde_json::json!({ "state": state });
-	out
+	(TxCache::Ok(state), out)
 }
 
 // ============================================================================
 // Cache
 // ============================================================================
+
+#[derive(Serialize, Deserialize)]
+struct Cache {
+	bg: BgCache,
+	pump: PumpCache,
+	tx: TxCache,
+}
 
 fn load_cache(path: &str) -> serde_json::Value {
 	fs::read_to_string(path)
@@ -572,9 +663,8 @@ fn save_cache(path: &str, value: &serde_json::Value) {
 // ============================================================================
 
 fn send_notification(n: &Notification) {
-	let urgency = if n.critical { "critical" } else { "normal" };
 	let _ = Command::new("notify-send")
-		.args(["-u", urgency, "CGM Alert", &n.message])
+		.args(["-u", n.urgency.into(), "CGM Alert", &n.message])
 		.status();
 }
 
@@ -586,66 +676,31 @@ fn main() {
 	let cli = Cli::parse();
 	let cfg = Config::load(cli.config.as_ref());
 
-	let cache = load_cache(&cfg.cache_file_path);
+	let cache: Cache = serde_json::from_value(load_cache(&cfg.cache_file_path)).unwrap();
 
 	// --- Run modules ---
-	let bg_prev = cache
-		.get("bg")
-		.and_then(|v| v.get("state"))
-		.and_then(|v| v.as_str())
-		.unwrap_or(NORMAL);
-	let tx_prev = cache
-		.get("transmitter")
-		.and_then(|v| v.get("state"))
-		.and_then(|v| v.as_str())
-		.unwrap_or(NORMAL);
-	let pump_prev = cache
-		.get("pump")
-		.cloned()
-		.unwrap_or_else(|| serde_json::json!({}));
-
-	let outputs = vec![
-		run_bg_module(&cli.url, &cfg.bg, bg_prev),
-		run_pump_module(&cli.url, &cfg.pump, &pump_prev),
-		run_transmitter_module(&cli.url, &cfg.transmitter, tx_prev),
-	];
+	let bg_result = run_bg_module(&cli.url, &cfg.bg, cache.bg);
+	let pump_result = run_pump_module(&cli.url, &cfg.pump, cache.pump);
+	let tx_result = run_transmitter_module(&cli.url, &cfg.transmitter, cache.tx);
 
 	// --- Combine outputs ---
-	let mut status_line = String::new();
-	let mut tooltip_lines: Vec<String> = Vec::new();
-	let mut classes: Vec<String> = Vec::new();
-	let mut notifications: Vec<Notification> = Vec::new();
-	let mut new_cache = serde_json::json!({});
+	let outputs = [bg_result.1, pump_result.1, tx_result.1];
 
-	for (name, out) in ["bg", "pump", "transmitter"].iter().zip(outputs) {
-		if !out.status_line.is_empty() {
-			if !status_line.is_empty() {
-				status_line.push(' ');
-			}
-			status_line.push_str(&out.status_line);
-		}
+	let status_line = outputs
+		.clone()
+		.map(|r| r.status_line)
+		.join(&" ".to_string());
 
-		tooltip_lines.extend(out.tooltip_lines);
+	let tooltip_lines = outputs.clone().map(|r| r.tooltip_lines).concat();
 
-		if out.css_class != NORMAL {
-			classes.push(out.css_class);
-		}
+	let overall_severity = outputs
+		.clone()
+		.map(|r| r.severity)
+		.into_iter()
+		.reduce(max)
+		.unwrap_or(Severity::Info);
 
-		notifications.extend(out.notifications);
-
-		new_cache[name] = out.cache_state;
-	}
-
-	// Overall class
-	let final_class = if classes.iter().any(|c| c == CRITICAL) {
-		CRITICAL
-	} else if classes.iter().any(|c| c == WARNING) {
-		WARNING
-	} else if classes.iter().any(|c| c == ERROR) {
-		ERROR
-	} else {
-		NORMAL
-	};
+	let notifications = outputs.map(|r| r.notifications).concat();
 
 	// --- Send notifications ---
 	for n in &notifications {
@@ -653,13 +708,21 @@ fn main() {
 	}
 
 	// --- Save cache ---
-	save_cache(&cfg.cache_file_path, &new_cache);
+	save_cache(
+		&cfg.cache_file_path,
+		&serde_json::to_value(Cache {
+			bg: bg_result.0,
+			pump: pump_result.0,
+			tx: tx_result.0,
+		})
+		.unwrap(),
+	);
 
 	// --- Emit Waybar JSON ---
 	let output = WaybarOutput {
 		text: status_line,
 		tooltip: tooltip_lines.join("\n"),
-		class: final_class.to_string(),
+		class: <Severity as Into<&str>>::into(overall_severity).to_string(),
 	};
 
 	println!("{}", serde_json::to_string(&output).unwrap());
