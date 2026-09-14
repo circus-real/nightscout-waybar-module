@@ -594,9 +594,9 @@ fn main() {
 	let status_line = outputs
 		.clone()
 		.map(|r| r.status_line)
-		.iter()
-		.filter(|l| l != &"")
-		.fold("".to_string(), |a, b| format!("{} {}", a.trim(), b.trim()));
+		.join(" ")
+		.trim()
+		.to_owned();
 
 	let tooltip_lines = outputs.clone().map(|r| r.tooltip_lines).concat();
 
