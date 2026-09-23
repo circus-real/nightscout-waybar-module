@@ -7,6 +7,9 @@ low_crit = 60.0
 high_crit = 250.0
 stale_mins = 15
 use_mmol_units = false
+use_delta = true
+delta_rising_warn = 27.0
+delta_falling_warn = 18.0
 
 [pump]
 res_show = 50.0

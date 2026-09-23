@@ -49,6 +49,9 @@ struct BgConfig {
 	high_crit: f64,
 	stale_mins: i64,
 	use_mmol_units: bool,
+	use_delta: bool,
+	delta_rising_warn: f64,
+	delta_falling_warn: f64,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -81,6 +84,9 @@ impl Default for BgConfig {
 			high_crit: 250.0,
 			stale_mins: 15,
 			use_mmol_units: false,
+			use_delta: true,
+			delta_rising_warn: 27.0,
+			delta_falling_warn: 18.0,
 		}
 	}
 }
@@ -134,9 +140,9 @@ enum Severity {
 impl From<Severity> for &str {
 	fn from(val: Severity) -> Self {
 		match val {
-			Severity::Critical => "crit",
-			Severity::Warning => "warn",
-			Severity::Info => "info",
+			Severity::Critical => "critical",
+			Severity::Warning => "warning",
+			Severity::Info => "ok",
 		}
 	}
 }
@@ -353,44 +359,80 @@ fn run_bg_module(url: &str, cfg: &BgConfig, cached: BgCache) -> (BgCache, Module
 		return (BgCache::Err(err), out);
 	}
 
-	let bg = convert_units(entry.sgv, cfg.use_mmol_units);
+	let current_bg = convert_units(entry.sgv, cfg.use_mmol_units);
 	let direction = entry.direction.as_deref().unwrap_or("NONE");
 	let arrow = arrow_for(direction);
 
-	let severity = classify_bg(cfg, bg);
-	let description = if bg > convert_units(cfg.high_warn, cfg.use_mmol_units) {
+	let mut severity = classify_bg(cfg, current_bg);
+	let description = if current_bg > convert_units(cfg.high_warn, cfg.use_mmol_units) {
 		"high"
-	} else if bg < convert_units(cfg.low_warn, cfg.use_mmol_units) {
+	} else if current_bg < convert_units(cfg.low_warn, cfg.use_mmol_units) {
 		"low"
 	} else {
 		"ok"
 	};
 
-	out.status_line = format!("{bg:.1} {arrow}");
-	out.tooltip_lines.push(if cfg.use_mmol_units {
-		format!("Current: {bg:.1} mmol/L {arrow}")
+	let (delta, delta_sev) = if let Ok(prev_bg) = cached {
+		let delta = current_bg - prev_bg;
+		let delta_sev = if delta >= cfg.delta_rising_warn || -delta >= cfg.delta_falling_warn {
+			Severity::Warning
+		} else {
+			Severity::Info
+		};
+		severity = *[severity, classify_bg(cfg, current_bg + delta), delta_sev]
+			.iter()
+			.reduce(max)
+			.unwrap_or(&Severity::Info);
+
+		(delta, delta_sev)
 	} else {
-		format!("Current: {bg:.0} mmol/L {arrow}")
+		(0.0, Severity::Info)
+	};
+
+	out.status_line = format!("{current_bg:.1} {arrow}");
+	out.tooltip_lines.push(if cfg.use_mmol_units {
+		format!("Current: {current_bg:.1} mmol/L {arrow}")
+	} else {
+		format!("Current: {current_bg:.0} mmol/L {arrow}")
 	});
-	out.tooltip_lines.push(format!(
-		"Status: {description} ({})",
-		<Severity as Into<&str>>::into(severity)
-	));
+	if cfg.use_delta {
+		if cfg.use_mmol_units {
+			out.status_line.push_str(&format!(" Δ {delta:.1}"));
+			out.tooltip_lines.push(format!(
+				"Delta: {}{:.1}",
+				if delta >= 0.0 { "+" } else { "-" },
+				delta.abs(),
+			));
+		} else {
+			out.status_line.push_str(&format!(" Δ {delta:.0}"));
+			out.tooltip_lines.push(format!(
+				"Delta: {}{:.0}",
+				if delta >= 0.0 { "+" } else { "-" },
+				delta.abs(),
+			));
+		}
+	}
+	if severity != Severity::Info {
+		out.tooltip_lines.push(format!(
+			"Status: {description} ({})",
+			<Severity as Into<&str>>::into(severity)
+		))
+	};
 	out.severity = severity;
 
 	if match cached {
-		BgCache::Ok(cache_bg) => classify_bg(cfg, cache_bg) != severity,
+		BgCache::Ok(prev_bg) => classify_bg(cfg, prev_bg) != severity,
 		BgCache::Err(_) => true,
 	} {
 		out.notifications.push(Notification {
 			message: if cfg.use_mmol_units {
 				format!(
-					"BG ALERT: {bg:.1} mmol/L ({})",
+					"BG ALERT: {current_bg:.1} mmol/L ({})",
 					<Severity as Into<&str>>::into(severity)
 				)
 			} else {
 				format!(
-					"BG ALERT: {bg:.0} mmol/L ({})",
+					"BG ALERT: {current_bg:.0} mmol/L ({})",
 					<Severity as Into<&str>>::into(severity)
 				)
 			},
@@ -398,7 +440,14 @@ fn run_bg_module(url: &str, cfg: &BgConfig, cached: BgCache) -> (BgCache, Module
 		});
 	}
 
-	(BgCache::Ok(bg), out)
+	if delta_sev != Severity::Info {
+		out.notifications.push(Notification {
+			message: "BG changing rapidly".to_string(),
+			urgency: NotificationUrgency::Normal,
+		});
+	}
+
+	(BgCache::Ok(current_bg), out)
 }
 
 // ============================================================================
@@ -633,7 +682,11 @@ fn main() {
 		class: if had_errors {
 			"error".to_string()
 		} else {
-			<Severity as Into<&str>>::into(overall_severity).to_string()
+			match overall_severity {
+				Severity::Critical => "crit".to_string(),
+				Severity::Warning => "warn".to_string(),
+				Severity::Info => "info".to_string(),
+			}
 		},
 	};
 
