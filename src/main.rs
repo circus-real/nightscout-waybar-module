@@ -393,7 +393,7 @@ fn run_bg_module(url: &str, cfg: &BgConfig, cached: BgCache) -> (BgCache, Module
 	out.tooltip_lines.push(if cfg.use_mmol_units {
 		format!("Current: {current_bg:.1} mmol/L {arrow}")
 	} else {
-		format!("Current: {current_bg:.0} mmol/L {arrow}")
+		format!("Current: {current_bg:.0} mg/dL {arrow}")
 	});
 	if cfg.use_delta {
 		if cfg.use_mmol_units {
